@@ -95,9 +95,12 @@ class EDMLoss:
         if self.warmup_ite:
             self.warmup_step = np.exp(np.log(100) / self.warmup_ite)
 
-    def __call__(self, net, images, labels=None, augment_pipe=None):
-        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+    def __call__(self, net, images, sigma, labels=None, augment_pipe=None):
+        # uniform sample: torch.Size([24, 1, 1, 1])
+        # random numbers from a normal distribution with mean 0 and variance 1
+        #rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        #sigma = (rnd_normal * self.P_std + self.P_mean).exp() # log normal of [0,20]
+        
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         if self.warmup_ite:
             if self.clamp_cur < self.clamp_max:
