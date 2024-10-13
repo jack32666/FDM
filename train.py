@@ -23,6 +23,8 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
+import wandb
+from training import networks 
 
 import warnings
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
@@ -87,6 +89,9 @@ def parse_int_list(s):
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
 
+@click.option('--actor-lr', help='ActorNetwork learning rate', type=float, default=1e-3, show_default=True)
+
+
 def main(**kwargs):
     opts = dnnlib.EasyDict(kwargs)
     torch.multiprocessing.set_start_method('spawn')
@@ -99,6 +104,9 @@ def main(**kwargs):
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8)
+
+    c.actor_network_kwargs = dnnlib.EasyDict(class_name='training.networks.ActorNetwork')
+    c.actor_optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.actor_lr)
 
     # Validate dataset options.
     try:
@@ -229,6 +237,9 @@ def main(**kwargs):
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
     dist.print0(f'network_kwargs:          {c.network_kwargs}')
     dist.print0(f'loss_kwargs:             {c.loss_kwargs}')
+    
+    dist.print0(f'Training ActorNetwork:    Yes')
+    dist.print0(f'ActorNetwork learning rate: {opts.actor_lr}')
     dist.print0()
 
     # Dry run?
@@ -243,9 +254,14 @@ def main(**kwargs):
         with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
             json.dump(c, f, indent=2)
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
+    
+        # Initialize wandb
+        wandb.init(project='fast-diffusion-models',
+                entity="myunsoo32666",
+                )
 
     # Train.
-    training_loop.training_loop(**c, lr_rampup_kimg=opts.lr_rampup * 1000)
+    training_loop.training_loop(**c, lr_rampup_kimg=opts.lr_rampup * 1000, logger=wandb)
 
 #----------------------------------------------------------------------------
 
