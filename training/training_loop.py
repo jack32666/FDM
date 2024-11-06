@@ -37,7 +37,7 @@ def feature_selector(kl_diff_lasso, kl_diff_sum_lasso, logger, global_steps, dis
     y = kl_diff_sum_lasso.cpu().numpy()  # Target vector
 
     # Select the best features using SelectKBest
-    k_best = SelectKBest(score_func=f_regression, k=5)
+    k_best = SelectKBest(score_func=f_regression, k=3)
     k_best.fit(X, y)
     selected_features_indices = k_best.get_support(indices=True)
     
@@ -93,9 +93,13 @@ def training_loop(
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    non_zero_coef_timesteps = [1e-8, 0.00001, 0.001, 0.1, 0.3, 0.5, 0.8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-    kl_diff_lasso_queue = deque(maxlen=20)
-    kl_diff_sum_lasso_queue = deque(maxlen=20)
+    
+    non_zero_coef_timesteps = np.linspace(0, 1, 51)
+    non_zero_coef_timesteps = np.clip(non_zero_coef_timesteps, 1e-8, 0.99999999)
+    non_zero_coef_timesteps = non_zero_coef_timesteps.tolist()
+    #non_zero_coef_timesteps = [1e-8, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99]
+    kl_diff_lasso_queue = deque(maxlen=1000)
+    kl_diff_sum_lasso_queue = deque(maxlen=1000)
     update_policy_interval = 1
     global_steps = 0
 
@@ -191,19 +195,21 @@ def training_loop(
                 #################### BEFORE DIFFUSION UPDATE ####################
                 if cur_nimg % 4992 == 0:
                     # KL_sum before for lasso
-                    range_T = torch.tensor([1e-8, 0.00001, 0.001, 0.1, 0.3, 0.5, 0.8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], device=device).view(-1, 1, 1, 1)
+                    range_T = torch.linspace(0, 1, 51).to(device=device)
+                    range_T = torch.clamp(range_T, min=1e-8, max=0.999).view(-1, 1, 1, 1)
+                    #range_T = torch.tensor([1e-8, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99], device=device).view(-1, 1, 1, 1)
                     random_index = torch.randint(0, images.shape[0], (1,))
                     x_sampled = images[random_index]
                     x_sampled = x_sampled.repeat(range_T.shape[0], 1, 1, 1)
                     with torch.no_grad():
-                        kl_before_for_lasso = loss_fn(net=ddp, images=x_sampled, sigma=range_T, labels=labels, augment_pipe=augment_pipe).sum(dim=[1, 2, 3])
+                        kl_before_for_lasso = loss_fn(net=ddp, images=x_sampled, timestep=range_T, labels=labels, augment_pipe=augment_pipe).sum(dim=[1, 2, 3])
                     
                     # KL_sum before for reward 
                     kl_divergence_tensor_list = []
                     for j in non_zero_coef_timesteps:
                         t_full = torch.full((images.shape[0],), j, device=device).view(-1, 1, 1, 1)
                         with torch.no_grad():
-                            kl_divergence_values = loss_fn(net=ddp, images=images, sigma=t_full, labels=labels, augment_pipe=augment_pipe)
+                            kl_divergence_values = loss_fn(net=ddp, images=images, timestep=t_full, labels=labels, augment_pipe=augment_pipe)
                         kl_divergence_tensor_list.append(kl_divergence_values)
                     kl_divergence_tensor_before = torch.stack(kl_divergence_tensor_list).transpose(0, 1).sum(dim=[1, 2, 3, 4])
                     
@@ -211,36 +217,37 @@ def training_loop(
                     #print("kl_divergence_tensor_before", kl_divergence_tensor_before, "non_zero_coef_timesteps", non_zero_coef_timesteps)
                 
                 #################### SAMPLE TIMESTEP ####################
-                # alpha_value, beta_value = actor_ddp(images)
-                # alpha_value = alpha_value.squeeze()
-                # beta_value = beta_value.squeeze()
+                alpha_value, beta_value = actor_ddp(images)
+                alpha_value = alpha_value.squeeze()
+                beta_value = beta_value.squeeze()
 
-                # beta_dist = Beta(alpha_value, beta_value)
-                # dist_sampled = beta_dist.sample()
+                beta_dist = Beta(alpha_value, beta_value)
+                dist_sampled = beta_dist.sample()
             
                 # timesteps = dist_sampled * 20  #Scale to [0, 20]
-                # timesteps = timesteps.view(images.shape[0], 1, 1, 1)
-                # timestep = torch.clamp(timesteps, min=0.1)
+                timesteps = dist_sampled
+                timesteps = timesteps.view(images.shape[0], 1, 1, 1)
+                timestep = torch.clamp(timesteps, min=1e-8)
                 
-                # log_probs = beta_dist.log_prob(dist_sampled)
-                # entropy = beta_dist.entropy()
+                log_probs = beta_dist.log_prob(dist_sampled)
+                entropy = beta_dist.entropy()
                 
-                normal_mean, normal_std = actor_ddp(images)
-                normal_mean = normal_mean.squeeze()
-                normal_std = normal_std.squeeze()
+                # normal_mean, normal_std = actor_ddp(images)
+                # normal_mean = normal_mean.squeeze()
+                # normal_std = normal_std.squeeze()
                 
-                normal_dist = Normal(normal_mean, normal_std)
-                dist_sampled = normal_dist.sample()
+                # normal_dist = Normal(normal_mean, normal_std)
+                # dist_sampled = normal_dist.sample()
                 
-                log_probs = normal_dist.log_prob(dist_sampled)
-                entropy = normal_dist.entropy()
+                # log_probs = normal_dist.log_prob(dist_sampled)
+                # entropy = normal_dist.entropy()
                 
-                rnd_normal = normal_mean.view(-1,1,1,1) + normal_std.view(-1,1,1,1) * torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-                timestep = (rnd_normal *1.2 - 1.2).exp() # log normal of [0,20]
-                timestep = torch.clamp((rnd_normal * 1.2 - 1.2).exp(), max=20)
+                # rnd_normal = normal_mean.view(-1,1,1,1) + normal_std.view(-1,1,1,1) * torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+                # timestep = (rnd_normal *1.2 - 1.2).exp() # log normal of [0,20]
+                # timestep = torch.clamp((rnd_normal * 1.2 - 1.2).exp(), max=20)
                 
                 #################### DIFFUSION UPDATE ####################
-                loss = loss_fn(net=ddp, images=images, sigma=timestep.detach(), labels=labels, augment_pipe=augment_pipe)
+                loss = loss_fn(net=ddp, images=images, timestep=timestep.detach(), labels=labels, augment_pipe=augment_pipe)
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
                 for g in optimizer.param_groups:
@@ -254,7 +261,7 @@ def training_loop(
                 if cur_nimg % 4992 == 0:
                     # KL_sum after for lasso
                     with torch.no_grad():
-                        kl_after_for_lasso = loss_fn(net=ddp, images=x_sampled, sigma=range_T, labels=labels, augment_pipe=augment_pipe).sum(dim=[1, 2, 3])
+                        kl_after_for_lasso = loss_fn(net=ddp, images=x_sampled, timestep=range_T, labels=labels, augment_pipe=augment_pipe).sum(dim=[1, 2, 3])
                     kl_diff_lasso = kl_before_for_lasso - kl_after_for_lasso
                     kl_diff_sum_lasso = kl_diff_lasso.sum()
                     
@@ -267,7 +274,7 @@ def training_loop(
                     for j in non_zero_coef_timesteps:
                         t_full = torch.full((images.shape[0],), j, device=device).view(-1, 1, 1, 1)
                         with torch.no_grad():
-                            kl_divergence_values = loss_fn(net=ddp, images=images, sigma=t_full, labels=labels, augment_pipe=augment_pipe)
+                            kl_divergence_values = loss_fn(net=ddp, images=images, timestep=t_full, labels=labels, augment_pipe=augment_pipe)
                         kl_divergence_tensor_list.append(kl_divergence_values)
                     kl_divergence_tensor_after = torch.stack(kl_divergence_tensor_list).transpose(0, 1).sum(dim=[1, 2, 3, 4])
                     kl_diff_sum = kl_divergence_tensor_before - kl_divergence_tensor_after
@@ -281,15 +288,17 @@ def training_loop(
                         pass
                     else:
                         # gets error when non_zero_coef_timesteps is 0
-                        range_T_array = np.array([1e-8, 0.00001, 0.001, 0.1, 0.3, 0.5, 0.8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
-                        non_zero_coef_timesteps_indices = feature_selector(stacked_kl_diff_lasso, stacked_kl_diff_sum_lasso, logger, global_steps, dist).tolist()
+                        range_T_array = np.linspace(0, 1, 51)
+                        range_T_array = np.clip(range_T_array, 1e-8, 0.99999999)
+                        #range_T_array = np.array([1e-8, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99])
+                        non_zero_coef_timesteps_indices = feature_selector(stacked_kl_diff_lasso, stacked_kl_diff_sum_lasso, logger, cur_nimg, dist).tolist()
                         non_zero_coef_timesteps = range_T_array[non_zero_coef_timesteps_indices].tolist()
                         print(non_zero_coef_timesteps)
                     
                     # REINFORCE 
                     reward = copy.deepcopy(kl_diff_sum.detach())
                     modified_reward = reward
-                    modified_reward += 0 * entropy 
+                    modified_reward += 1e-2 * entropy 
                     # Update the moving average
                     # alpha = 0.5  
                     # reward_moving_avg = reward_moving_avg if 'reward_moving_avg' in locals() else reward.mean().repeat(images.shape[0])
@@ -332,9 +341,9 @@ def training_loop(
                 "policy/log_prob": log_probs.mean().item(),
                 "policy/reward": reward.mean(),
                 "policy/entropy": entropy.mean(),
-                "policy/normal_mean": normal_mean.mean(),
-                "policy/normal_std": normal_std.mean(),
-            }, step=global_steps)
+                "policy/alpha_value": alpha_value.mean(),
+                "policy/beta_value": beta_value.mean(),
+            }, step=cur_nimg)
 
 
             # Create a figure with subplots
@@ -349,20 +358,20 @@ def training_loop(
 
             # Plot normal distributions of policy
             x_axis = np.linspace(0, 1, 1000)
-            for a, b in zip(normal_mean, normal_std):
+            for a, b in zip(alpha_value, beta_value):
                 a = a.item()  # Convert tensor value to a scalar
                 b = b.item()  # Convert tensor value to a scalar
-                y = norm.pdf(x_axis, a, b)  # Compute the normal distribution's PDF
+                y = beta.pdf(x_axis, a, b)  # Compute the normal distribution's PDF
                 ax2.plot(x_axis, y, alpha=0.1)  # Plot with some transparency
             ax2.set_xlabel('x_axis')
             ax2.set_ylabel('Density')
-            ax2.set_title('Normal Distributions')
+            ax2.set_title('Beta Distributions')
 
             # Save the figure
             plt.savefig("combined_plot.png")
 
             # Log the figure using logger
-            logger.log({"KL_diveregence, timestep histogram, and normal distributions": logger.Image(plt)}, step=global_steps)
+            logger.log({"KL_diveregence, timestep histogram, and beta distributions": logger.Image(plt)}, step=cur_nimg)
             plt.close()
 
 
